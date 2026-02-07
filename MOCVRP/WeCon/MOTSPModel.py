@@ -1,0 +1,735 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from MOELayer import MoE
+
+
+def _safe_multinomial(weights_2d: torch.Tensor, fallback_idx_1d: torch.Tensor):
+    """
+    weights_2d: (N, A) non-negative weights; if a row sum<=0 -> one-hot fallback
+    fallback_idx_1d: (N,) fallback action index
+    """
+    w = weights_2d.clone()
+    row_sum = w.sum(dim=-1)  # (N,)
+    bad = row_sum <= 0
+    if bad.any():
+        w[bad] = 0.0
+        w[bad].scatter_(dim=1, index=fallback_idx_1d[bad].unsqueeze(1), value=1.0)
+    return w.multinomial(1).squeeze(1)
+
+def sample_pomo_every4th_topk_else_random(
+    probs: torch.Tensor,   # (B,P,A) may contain NaN
+    k: int = 4,
+    eps: float = 1e-12,
+):
+    """
+    pomo index p:
+      p%4==0 -> sample within top-k candidates (k=4) using original prob weights
+      else   -> sample from full distribution using original prob weights
+    return:
+      selected: (B,P)
+      prob:     (B,P) from ORIGINAL probs (not changed), clamped for log safety
+    """
+    assert probs.dim() == 3, f"Expected (B,P,A), got {probs.shape}"
+    B, P, A = probs.shape
+    device = probs.device
+    k_eff = min(int(k), A)
+
+    # sampling weights q: keep probs unchanged, but treat NaN/Inf as 0 during sampling
+    q = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+
+    # fallback per (B,P): argmax on original probs (NaN treated as very small)
+    probs_for_argmax = torch.nan_to_num(probs, nan=-1e9, posinf=-1e9, neginf=-1e9)
+    fallback = probs_for_argmax.argmax(dim=-1)  # (B,P)
+
+    selected = torch.empty((B, P), dtype=torch.long, device=device)
+
+    p_idx = torch.arange(P, device=device)
+    mask_top = (p_idx % 10 == 0)   # 0,4,8,12...
+    mask_rnd = ~mask_top          # others
+
+    # ---- top-k pomo branches ----
+    if mask_top.any():
+        q_top = q[:, mask_top, :]              # (B, Pt, A)
+        fb_top = fallback[:, mask_top]         # (B, Pt)
+        Pt = q_top.size(1)
+
+        top_idx = torch.topk(q_top, k=k_eff, dim=-1, largest=True).indices  # (B,Pt,k)
+        w = torch.zeros_like(q_top)
+        w.scatter_(dim=-1, index=top_idx, value=1.0)
+        w = w * q_top  # only keep top-k weights (not renormed)
+
+        sel = _safe_multinomial(
+            w.reshape(B * Pt, A),
+            fb_top.reshape(B * Pt)
+        ).reshape(B, Pt)
+        selected[:, mask_top] = sel
+
+    # ---- random pomo branches (full) ----
+    if mask_rnd.any():
+        q_rnd = q[:, mask_rnd, :]              # (B, Pr, A)
+        fb_rnd = fallback[:, mask_rnd]         # (B, Pr)
+        Pr = q_rnd.size(1)
+
+        sel = _safe_multinomial(
+            q_rnd.reshape(B * Pr, A),
+            fb_rnd.reshape(B * Pr)
+        ).reshape(B, Pr)
+        selected[:, mask_rnd] = sel
+
+    # prob MUST be from original probs (do not change prob values)
+    prob = probs.gather(dim=-1, index=selected.unsqueeze(-1)).squeeze(-1)
+    prob = torch.nan_to_num(prob, nan=0.0).clamp_min(eps)  # for log safety only
+
+    return selected, prob
+class TSPModel(nn.Module):
+
+    def __init__(self, **model_params):
+        super().__init__()
+        self.model_params = model_params
+
+        self.encoder = TSP_Encoder(**model_params)
+        self.decoder = TSP_DecoderV1(**model_params)
+        self.encoded_nodes = None
+        # shape: (batch, problem, EMBEDDING_DIM)
+
+    def pre_forward(self, reset_state, pref):
+        self.encoded_nodes = self.encoder(reset_state.problems, pref)
+        # shape: (batch, problem, EMBEDDING_DIM)
+        self.decoder.set_kv(self.encoded_nodes)
+
+    def forward(self, state, route=None, return_probs=False, selected_count=None):
+        batch_size = state.BATCH_IDX.size(0)
+        pomo_size = state.BATCH_IDX.size(1)
+
+        if state.current_node is None:
+            selected = torch.arange(pomo_size)[None, :].expand(batch_size, pomo_size)
+            prob = torch.ones(size=(batch_size, pomo_size))
+            if return_probs:
+                probs = torch.ones(size=(batch_size, pomo_size, self.encoded_nodes.size(1)))
+
+            encoded_first_node = _get_encoding(self.encoded_nodes, selected)
+            # shape: (batch, pomo, embedding)
+            self.decoder.set_q1(encoded_first_node)
+
+        else:
+            encoded_last_node = _get_encoding(self.encoded_nodes, state.current_node)
+            # shape: (batch, pomo, embedding)
+            probs = self.decoder(encoded_last_node, ninf_mask=state.ninf_mask)
+            # shape: (batch, pomo, problem)
+
+            if route is None:
+                if self.training or self.model_params['eval_type'] == 'softmax':
+                    #selected = probs.reshape(batch_size * pomo_size, -1).multinomial(1).squeeze(dim=1).reshape(batch_size, pomo_size)
+                    # shape: (batch, pomo)
+
+                    #prob = probs[state.BATCH_IDX, state.POMO_IDX, selected].reshape(batch_size, pomo_size)
+                    # shape: (batch, pomo)
+                    selected, prob = sample_pomo_every4th_topk_else_random(probs, k=5)
+
+                else:
+                    selected = probs.argmax(dim=2)
+                    # shape: (batch, pomo)
+                    prob = None
+            else:
+                selected = route[:, :, selected_count].reshape(batch_size, pomo_size).long()
+                prob = probs[state.BATCH_IDX, state.POMO_IDX, selected].reshape(batch_size, pomo_size)
+
+        if return_probs:
+            return selected, prob, probs
+        return selected, prob
+
+def _get_encoding(encoded_nodes, node_index_to_pick):
+    # encoded_nodes.shape: (batch, problem, embedding)
+    # node_index_to_pick.shape: (batch, pomo)
+
+    batch_size = node_index_to_pick.size(0)
+    pomo_size = node_index_to_pick.size(1)
+    embedding_dim = encoded_nodes.size(2)
+
+    gathering_index = node_index_to_pick[:, :, None].expand(batch_size, pomo_size, embedding_dim)
+    # shape: (batch, pomo, embedding)
+
+    picked_nodes = encoded_nodes.gather(dim=1, index=gathering_index)
+    # shape: (batch, pomo, embedding)
+
+    return picked_nodes
+
+
+########################################
+# ENCODER
+########################################
+
+class TSP_Encoder(nn.Module):
+    def __init__(self, **model_params):
+        super().__init__()
+        self.model_params = model_params
+        embedding_dim = self.model_params['embedding_dim']
+        encoder_layer_num = self.model_params['encoder_layer_num']
+
+        self.embedding_pref = nn.Linear(2, embedding_dim)
+        self.embedding = nn.Linear(4, embedding_dim)
+        self.layers = nn.ModuleList([EncoderLayerV1_9(**model_params) for _ in range(encoder_layer_num)])
+
+    def forward(self, data, pref):
+        # data.shape: (batch, problem, 2)
+
+        embedded_pref = self.embedding_pref(pref)[None, None, :].repeat(data.shape[0], 1, 1)
+
+        embedded_input = self.embedding(data)
+        # shape: (batch, problem, embedding)
+
+        out = torch.cat((embedded_input, embedded_pref), dim=1)
+
+        for layer in self.layers:
+            out = layer(out)
+
+        return out
+
+class FiLM(nn.Module):
+    """ Feature-wise Linear Modulation (FiLM) layer"""
+
+    def __init__(self, input_size, output_size):
+        """
+        :param input_size: feature size of x_cond
+        :param output_size: feature size of x_to_film
+        """
+        super(FiLM, self).__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        film_output_size = self.output_size * 2
+        self.gb_weights = nn.Linear(self.input_size, film_output_size, bias=False)
+
+    def forward(self, x_cond, x_to_film):
+        gb = self.gb_weights(x_cond)
+        gamma, beta = torch.chunk(gb, 2, dim=-1)
+        out = gamma * x_to_film + beta
+        return out
+
+class EncoderLayer(nn.Module):
+    def __init__(self, **model_params):
+        super().__init__()
+        self.model_params = model_params
+        embedding_dim = self.model_params['embedding_dim']
+        head_num = self.model_params['head_num']
+        qkv_dim = self.model_params['qkv_dim']
+
+        self.Wq = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wk = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wv = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.multi_head_combine = nn.Linear(head_num * qkv_dim, embedding_dim)
+
+        self.addAndNormalization1 = Add_And_Normalization_Module(**model_params)
+        self.feedForward = Feed_Forward_Module(**model_params)
+        self.addAndNormalization2 = Add_And_Normalization_Module(**model_params)
+
+        self.node_conditional_alignment = FiLM(embedding_dim, embedding_dim)  # FiLM
+
+    def forward(self, input1):
+        input = input1.clone()
+        input[:, :-1] = self.node_conditional_alignment(x_cond=input1[:, -1, None].repeat(1, input1.shape[1] - 1, 1), x_to_film=input1[:, :-1])
+
+        # input.shape: (batch, problem, EMBEDDING_DIM)
+        head_num = self.model_params['head_num']
+
+        q = reshape_by_heads(self.Wq(input), head_num=head_num)
+        k = reshape_by_heads(self.Wk(input), head_num=head_num)
+        v = reshape_by_heads(self.Wv(input), head_num=head_num)
+        # q shape: (batch, HEAD_NUM, problem, KEY_DIM)
+
+        out_concat = multi_head_attention(q, k, v)
+        # shape: (batch, problem, HEAD_NUM*KEY_DIM)
+
+        multi_head_out = self.multi_head_combine(out_concat)
+        # shape: (batch, problem, EMBEDDING_DIM)
+
+        out1 = self.addAndNormalization1(input1, multi_head_out)
+        out2 = self.feedForward(out1)
+        out3 = self.addAndNormalization2(out1, out2)
+
+        return out3
+        # shape: (batch, problem, EMBEDDING_DIM)
+
+class EncoderLayerV1_9(nn.Module):
+    def __init__(self, **model_params):
+        super().__init__()
+        self.model_params = model_params
+        D  = model_params['embedding_dim']
+        H  = model_params['head_num']
+        Dh = model_params['qkv_dim']
+
+        # ===== (1) nodes self-attn =====
+        self.Wq_n = nn.Linear(D, H * Dh, bias=False)
+        self.Wk_n = nn.Linear(D, H * Dh, bias=False)
+        self.Wv_n = nn.Linear(D, H * Dh, bias=False)
+        self.combine1 = nn.Linear(H * Dh, D)
+        # ===== (2) pref reads nodes (pref as Q, nodes as KV) =====
+        self.Wq_p = nn.Linear(D, H * Dh, bias=False)
+        self.Wk_p = nn.Linear(D, H * Dh, bias=False)
+        self.Wv_p = nn.Linear(D, H * Dh, bias=False)
+        self.combine2 = nn.Linear(H * Dh, D)
+
+        # ===== (2b) nodes read pref (nodes as Q, pref as KV) =====
+        self.Wq_np = nn.Linear(D, H * Dh, bias=False)
+        self.Wk_np = nn.Linear(D, H * Dh, bias=False)
+        self.Wv_np = nn.Linear(D, H * Dh, bias=False)
+        self.combine3 = nn.Linear(H * Dh, D)
+
+        # ===== gated write-back（保留你原来的）=====
+        self.gate = nn.Sequential(
+            nn.Linear(2 * D, D),
+            nn.GELU(),
+            nn.Linear(D, D),
+            nn.Sigmoid()
+        )
+        self.write = nn.Linear(D, D, bias=False)
+        #self.alpha_write = nn.Parameter(torch.tensor(0.0))  # 初始也更保守
+        #init_scale = self.model_params.get("write_init", 0.25)
+        #init_logit = math.log(init_scale / (1.0 - init_scale))  # logit
+        #self.alpha_write = nn.Parameter(torch.ones(D) * init_logit)  # (D,)
+
+        # ===== Add&Norm =====
+        self.addnorm_n1 = Add_And_Normalization_Module(**model_params)
+        self.addnorm_n2 = Add_And_Normalization_Module(**model_params)
+        self.addnorm_p1 = Add_And_Normalization_Module(**model_params)
+        self.addnorm_p2 = Add_And_Normalization_Module(**model_params)
+        self.addnorm_n3 = Add_And_Normalization_Module(**model_params)
+        self.addnorm_n4 = Add_And_Normalization_Module(**model_params)
+
+        # ===== FFN =====
+        if model_params['ffd'] == 'ffd':
+            self.ffn_nodes  = Feed_Forward_Module(**model_params)
+            self.ffn_pref   = Feed_Forward_Module(**model_params)
+            self.ffn_nodes2 = Feed_Forward_Module(**model_params)  # 给(2b)单独一套（也可共享）
+        elif model_params['ffd'] == 'siglu':
+            assert D == 128
+            self.ffn_nodes  = ParallelGatedMLP()
+            self.ffn_pref   = ParallelGatedMLP()
+            self.ffn_nodes2 = ParallelGatedMLP()
+        else:
+            raise NotImplementedError
+
+    def forward(self, input1):
+        H = self.model_params['head_num']
+        nodes = input1[:, :-1, :]   # (B, N, D)
+        pref  = input1[:, -1:, :]   # (B, 1, D)
+
+        # ===== (1) nodes self-attn =====
+        qn = reshape_by_heads(self.Wq_n(nodes), head_num=H)  # (B,H,N,Dh)
+        kn = reshape_by_heads(self.Wk_n(nodes), head_num=H)
+        vn = reshape_by_heads(self.Wv_n(nodes), head_num=H)
+        nodes_attn = multi_head_attention(qn, kn, vn)        # (B,N,H*Dh)
+        nodes_attn = self.combine1(nodes_attn)               # (B,N,D)
+        nodes1 = self.addnorm_n1(nodes, nodes_attn)
+        nodes_ff = self.ffn_nodes(nodes1)
+        nodes2 = self.addnorm_n2(nodes1, nodes_ff)           # (B,N,D)
+
+        # ===== (2) pref reads nodes =====
+        qp = reshape_by_heads(self.Wq_p(pref),  head_num=H)  # (B,H,1,Dh)
+        kp = reshape_by_heads(self.Wk_p(nodes2), head_num=H) # (B,H,N,Dh)
+        vp = reshape_by_heads(self.Wv_p(nodes2), head_num=H)
+        pref_ctx = multi_head_attention(qp, kp, vp)          # (B,1,H*Dh)
+        pref_ctx = self.combine2(pref_ctx)                   # (B,1,D)
+        pref1 = self.addnorm_p1(pref, pref_ctx)
+        pref_ff = self.ffn_pref(pref1)
+        pref2 = self.addnorm_p2(pref1, pref_ff)              # (B,1,D)
+
+        
+        q_np = reshape_by_heads(self.Wq_np(nodes2),   head_num=H)  # (B,H,N,Dh)
+        k_np = reshape_by_heads(self.Wk_np(pref2),  head_num=H)  # (B,H,T,Dh)
+        v_np = reshape_by_heads(self.Wv_np(pref2),  head_num=H)
+        nodes_pref = multi_head_attention(q_np, k_np, v_np)        # (B,N,H*Dh)
+        nodes_pref = self.combine3(nodes_pref)                     # (B,N,D)
+        nodes2b = self.addnorm_n3(nodes2, nodes_pref)
+        nodes2b_ff = self.ffn_nodes2(nodes2b)
+        nodes2c = self.addnorm_n4(nodes2b, nodes2b_ff)             # (B,N,D)
+        
+        # ===== (3) gated write-back（保留你原来的）=====
+        pref_exp = pref2.expand(-1, nodes2c.size(1), -1)           
+        
+        g = self.gate(torch.cat([nodes2c, pref_exp], dim=-1))      # (B,N,D)
+        nodes3 = nodes2c + g * self.write(pref_exp)                # (B,N,D)
+
+        out = torch.cat([nodes3, pref2], dim=1)                    # (B,N+1,D)
+        return out
+########################################
+# DECODER
+########################################
+class PrefPolyNet(nn.Module):
+    """
+    attn_out: (B, N, E)
+    pref:     (B, 1, E)
+    return:   (B, N, E)  = attn_out + MLP([attn_out || pref])
+    """
+    def __init__(self, emb_dim: int, hidden_dim: int = None):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = emb_dim * 2  # 你也可以换成 model_params['ff_hidden_dim']
+
+        self.fc1 = nn.Linear(emb_dim * 2, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, emb_dim)
+
+        
+
+    def forward(self, attn_out, pref):
+        B, N, E = attn_out.size()
+        # pref: (B,1,E) -> (B,N,E)
+        pref_expand = pref.expand(B, N, E)
+
+        x = torch.cat([attn_out, pref_expand], dim=-1)  # (B,N,2E)
+        delta = self.fc2(F.relu(self.fc1(x)))           # (B,N,E)
+        return attn_out + delta
+class TSP_DecoderV1(nn.Module):
+    def __init__(self, **model_params):
+        super().__init__()
+        self.model_params = model_params
+        embedding_dim = self.model_params['embedding_dim']
+        head_num = self.model_params['head_num']
+        qkv_dim = self.model_params['qkv_dim']
+
+        self.Wq_first = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wq_last = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wk = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wv = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+
+        self.multi_head_combine = nn.Linear(head_num * qkv_dim, embedding_dim)
+        self.pref_polynet = PrefPolyNet(emb_dim=embedding_dim, hidden_dim=self.model_params['ff_hidden_dim'])
+
+        self.moed_layer = MoE(input_size=embedding_dim, output_size=embedding_dim,
+                                   num_experts=self.model_params['num_experts'],
+                                   hidden_size=self.model_params['ff_hidden_dim'], k=self.model_params['topk'], T=1.0,
+                                   noisy_gating=True,
+                                   routing_level=self.model_params['routing_level'],
+                                   routing_method=self.model_params['routing_method'], moed_model="MLP")
+        count_router_and_experts_params(self.moed_layer)
+
+        self.addAndNormalization = Add_And_Normalization_Module(**model_params)
+        count_router_and_experts_params(self.addAndNormalization)
+
+        self.k = None  # saved key, for multi-head attention
+        self.v = None  # saved value, for multi-head_attention
+        self.pref_emb = None
+        self.single_head_key = None  # saved, for single-head attention
+        self.q_first = None  # saved q1, for multi-head attention
+
+    def set_kv(self, encoded_nodes):
+        # encoded_nodes.shape: (batch, problem, embedding)
+        head_num = self.model_params['head_num']
+
+        self.k = reshape_by_heads(self.Wk(encoded_nodes), head_num=head_num)
+        self.v = reshape_by_heads(self.Wv(encoded_nodes), head_num=head_num)
+
+        # shape: (batch, head_num, pomo, qkv_dim)
+        self.single_head_key = encoded_nodes[:, :-1].transpose(1, 2)
+        self.pref_emb = encoded_nodes[:, -1:,:]
+        # shape: (batch, embedding, problem)
+
+    def set_q1(self, encoded_q1):
+        # encoded_q.shape: (batch, n, embedding)  # n can be 1 or pomo
+        head_num = self.model_params['head_num']
+
+        self.q_first = reshape_by_heads(self.Wq_first(encoded_q1), head_num=head_num)
+        # shape: (batch, head_num, n, qkv_dim)
+
+    def forward(self, encoded_last_node, ninf_mask):
+        # encoded_last_node.shape: (batch, pomo, embedding)
+        # ninf_mask.shape: (batch, pomo, problem)
+
+        embedding_dim = self.model_params['embedding_dim']
+        head_num = self.model_params['head_num']
+        qkv_dim = self.model_params['qkv_dim']
+
+        head_num = self.model_params['head_num']
+
+        #  Multi-Head Attention
+        #######################################################
+        q_last = reshape_by_heads(self.Wq_last(encoded_last_node), head_num=head_num)
+
+        q = self.q_first + q_last
+        # shape: (batch, head_num, pomo, qkv_dim)
+
+        out_concat = multi_head_attention(q, self.k, self.v, rank3_ninf_mask=torch.cat((ninf_mask, torch.zeros(ninf_mask.shape[0], ninf_mask.shape[1], 1)), dim=-1))
+        # out_concat = multi_head_attention(q, self.k, self.v, rank3_ninf_mask=ninf_mask)
+        # shape: (batch, pomo, head_num*qkv_dim)
+
+        mh_atten_out = self.multi_head_combine(out_concat)
+        mh_atten_out = self.pref_polynet(mh_atten_out, self.pref_emb)
+        # shape: (batch, pomo, embedding)
+
+        mh_atten, _ = self.moed_layer(mh_atten_out)
+        mh_atten_out = self.addAndNormalization(mh_atten_out, mh_atten)
+        #  Single-Head Attention, for probability calculation
+        #######################################################
+        score = torch.matmul(mh_atten_out, self.single_head_key)
+        # shape: (batch, pomo, problem)
+
+        sqrt_embedding_dim = self.model_params['sqrt_embedding_dim']
+        logit_clipping = self.model_params['logit_clipping']
+
+        score_scaled = score / sqrt_embedding_dim
+        # shape: (batch, pomo, problem)
+
+        score_clipped = logit_clipping * torch.tanh(score_scaled)
+
+        score_masked = score_clipped + ninf_mask
+
+        probs = F.softmax(score_masked, dim=2)
+        # shape: (batch, pomo, problem)
+
+        return probs
+class TSP_Decoder(nn.Module):
+    def __init__(self, **model_params):
+        super().__init__()
+        self.model_params = model_params
+        embedding_dim = self.model_params['embedding_dim']
+        head_num = self.model_params['head_num']
+        qkv_dim = self.model_params['qkv_dim']
+
+        self.Wq_first = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wq_last = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wk = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wv = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+
+        self.multi_head_combine = nn.Linear(head_num * qkv_dim, embedding_dim)
+
+        self.k = None  # saved key, for multi-head attention
+        self.v = None  # saved value, for multi-head_attention
+        self.single_head_key = None  # saved, for single-head attention
+        self.q_first = None  # saved q1, for multi-head attention
+        self.pref_emb = None
+        self.pref_polynet = PrefPolyNet(emb_dim=embedding_dim, hidden_dim=self.model_params['ff_hidden_dim'])
+
+
+    def set_kv(self, encoded_nodes):
+        # encoded_nodes.shape: (batch, problem, embedding)
+        head_num = self.model_params['head_num']
+
+        self.k = reshape_by_heads(self.Wk(encoded_nodes), head_num=head_num)
+        self.v = reshape_by_heads(self.Wv(encoded_nodes), head_num=head_num)
+        self.pref_emb = encoded_nodes[:, -1:,:]
+        # shape: (batch, head_num, pomo, qkv_dim)
+        self.single_head_key = encoded_nodes[:, :-1].transpose(1, 2)
+        # shape: (batch, embedding, problem)
+
+    def set_q1(self, encoded_q1):
+        # encoded_q.shape: (batch, n, embedding)  # n can be 1 or pomo
+        head_num = self.model_params['head_num']
+
+        self.q_first = reshape_by_heads(self.Wq_first(encoded_q1), head_num=head_num)
+        # shape: (batch, head_num, n, qkv_dim)
+
+    def forward(self, encoded_last_node, ninf_mask):
+        # encoded_last_node.shape: (batch, pomo, embedding)
+        # ninf_mask.shape: (batch, pomo, problem)
+
+        embedding_dim = self.model_params['embedding_dim']
+        head_num = self.model_params['head_num']
+        qkv_dim = self.model_params['qkv_dim']
+
+        head_num = self.model_params['head_num']
+
+        #  Multi-Head Attention
+        #######################################################
+        q_last = reshape_by_heads(self.Wq_last(encoded_last_node), head_num=head_num)
+
+        q = self.q_first + q_last
+        # shape: (batch, head_num, pomo, qkv_dim)
+
+        out_concat = multi_head_attention(q, self.k, self.v, rank3_ninf_mask=torch.cat((ninf_mask, torch.zeros(ninf_mask.shape[0], ninf_mask.shape[1], 1)), dim=-1))
+        # shape: (batch, pomo, head_num*qkv_dim)
+
+        mh_atten_out = self.multi_head_combine(out_concat)
+        mh_atten_out = self.pref_polynet(mh_atten_out, self.pref_emb)
+        # shape: (batch, pomo, embedding)
+
+        #  Single-Head Attention, for probability calculation
+        #######################################################
+        score = torch.matmul(mh_atten_out, self.single_head_key)
+        # shape: (batch, pomo, problem)
+
+        sqrt_embedding_dim = self.model_params['sqrt_embedding_dim']
+        logit_clipping = self.model_params['logit_clipping']
+
+        score_scaled = score / sqrt_embedding_dim
+        # shape: (batch, pomo, problem)
+
+        score_clipped = logit_clipping * torch.tanh(score_scaled)
+
+        score_masked = score_clipped + ninf_mask
+
+        probs = F.softmax(score_masked, dim=2)
+        # shape: (batch, pomo, problem)
+
+        return probs
+
+
+########################################
+# NN SUB CLASS / FUNCTIONS
+########################################
+def count_router_and_experts_params(moe_model):
+    router_params = 0
+    expert_params = 0
+
+    for name, param in moe_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "experts" in name:
+            expert_params += param.numel()
+        else:
+            router_params += param.numel()
+
+    print(f"Router Parameters: {router_params}")
+    print(f"Experts Parameters: {expert_params}")
+    print(f"Total Parameters: {router_params + expert_params}")
+def reshape_by_heads(qkv, head_num):
+    # q.shape: (batch, n, head_num*key_dim)   : n can be either 1 or PROBLEM_SIZE
+
+    batch_s = qkv.size(0)
+    n = qkv.size(1)
+
+    q_reshaped = qkv.reshape(batch_s, n, head_num, -1)
+    # shape: (batch, n, head_num, key_dim)
+
+    q_transposed = q_reshaped.transpose(1, 2)
+    # shape: (batch, head_num, n, key_dim)
+
+    return q_transposed
+
+
+def multi_head_attention(q, k, v, rank2_ninf_mask=None, rank3_ninf_mask=None):
+    # q shape: (batch, head_num, n, key_dim)   : n can be either 1 or PROBLEM_SIZE
+    # k,v shape: (batch, head_num, problem, key_dim)
+    # rank2_ninf_mask.shape: (batch, problem)
+    # rank3_ninf_mask.shape: (batch, group, problem)
+
+    batch_s = q.size(0)
+    head_num = q.size(1)
+    n = q.size(2)
+    key_dim = q.size(3)
+
+    input_s = k.size(2)
+
+    score = torch.matmul(q, k.transpose(2, 3))
+    # shape: (batch, head_num, n, problem)
+
+    score_scaled = score / torch.sqrt(torch.tensor(key_dim, dtype=torch.float))
+    if rank2_ninf_mask is not None:
+        score_scaled = score_scaled + rank2_ninf_mask[:, None, None, :].expand(batch_s, head_num, n, input_s)
+    if rank3_ninf_mask is not None:
+        score_scaled = score_scaled + rank3_ninf_mask[:, None, :, :].expand(batch_s, head_num, n, input_s)
+
+    weights = nn.Softmax(dim=3)(score_scaled)
+    # shape: (batch, head_num, n, problem)
+
+    out = torch.matmul(weights, v)
+    # shape: (batch, head_num, n, key_dim)
+
+    out_transposed = out.transpose(1, 2)
+    # shape: (batch, n, head_num, key_dim)
+
+    out_concat = out_transposed.reshape(batch_s, n, head_num * key_dim)
+    # shape: (batch, n, head_num*key_dim)
+
+    return out_concat
+
+
+class Add_And_Normalization_Module(nn.Module):
+    def __init__(self, **model_params):
+        super().__init__()
+        
+        embedding_dim = model_params['embedding_dim']
+        self.norm_type = model_params['norm_type'] # instance or layer
+        if self.norm_type == 'instance':
+            self.norm = nn.InstanceNorm1d(embedding_dim, affine=True, track_running_stats=False)
+        elif self.norm_type == 'rms': # layer
+            self.norm = RMSNorm(embedding_dim)
+        elif self.norm_type == 'scale':
+            self.norm = ScaleNorm(embedding_dim)
+        else:
+            raise NotImplementedError
+
+    def forward(self, input1, input2):
+        # input.shape: (batch, problem, embedding)
+        added = input1 + input2
+        # shape: (batch, problem, embedding)
+        if self.norm_type == 'instance':
+            out = self.norm(added.transpose(1, 2)).transpose(1, 2) # (batch, problem, embedding)
+        else:  # layer rms
+            out = self.norm(added) # (batch, problem, embedding)
+        return out
+
+
+
+class RMSNorm(nn.Module):
+    """From https://github.com/meta-llama/llama-models"""
+    def __init__(self, dim: int, eps: float = 1e-5, **kwargs):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+class ParallelGatedMLP(nn.Module):
+    """From https://github.com/togethercomputer/stripedhyena"""
+
+    def __init__(
+        self,
+        hidden_size: int = 128,
+        inner_size_multiple_of: int = 256,
+        mlp_activation: str = "silu",
+        model_parallel_size: int = 1,
+    ):
+        super().__init__()
+        multiple_of = inner_size_multiple_of
+        self.act_type = mlp_activation
+        if self.act_type == "gelu":
+            self.act = F.gelu
+        elif self.act_type == "silu":
+            self.act = F.silu
+        else:
+            raise NotImplementedError
+        self.multiple_of = multiple_of * model_parallel_size
+        inner_size = int(2 * hidden_size * 4 / 3)
+        inner_size = self.multiple_of * (
+            (inner_size + self.multiple_of - 1) // self.multiple_of
+        ) # 512
+
+        self.l1 = nn.Linear(
+            in_features=hidden_size,
+            out_features=inner_size,
+            bias=False,
+        )
+        self.l2 = nn.Linear(
+            in_features=hidden_size,
+            out_features=inner_size,
+            bias=False,
+        )
+        self.l3 = nn.Linear(
+            in_features=inner_size,
+            out_features=hidden_size,
+            bias=False,
+        )
+
+    def forward(self, z):
+        z1, z2 = self.l1(z), self.l2(z)
+        return self.l3(self.act(z1) * z2)       
+
+
+class Feed_Forward_Module(nn.Module):
+    def __init__(self, **model_params):
+        super().__init__()
+        embedding_dim = model_params['embedding_dim']
+        ff_hidden_dim = model_params['ff_hidden_dim']
+
+        self.W1 = nn.Linear(embedding_dim, ff_hidden_dim)
+        self.W2 = nn.Linear(ff_hidden_dim, embedding_dim)
+
+    def forward(self, input1):
+        # input.shape: (batch, problem, embedding)
+
+        return self.W2(F.relu(self.W1(input1)))
